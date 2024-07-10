@@ -2527,6 +2527,76 @@ class ReconstructQDQGemm(DFPatternCallback):
         
         return dequant_act
 
+class InsertQDQOnBiases(DFPatternCallback):
+    def __init__(self):
+        super().__init__(rewrite_once=True, require_type=True)
+        self.weight = wildcard()
+        self.act = wildcard()
+        self.bias = wildcard()
+
+        self.dequant_w = is_op("qnn.dequantize")(self.weight, wildcard(), wildcard(),)
+        self.transpose1 = is_op("transpose")(self.dequant_w)
+        self.transpose2 = is_op("transpose")(self.transpose1)
+
+        self.dequant_act = is_op("qnn.dequantize")(self.act, wildcard(), wildcard(),)
+        self.dequant_act = self.dequant_act | is_op("reshape")(is_op("reshape")(is_op("transpose")(self.dequant_act)))
+
+        self.op = is_op('nn.dense')(self.dequant_act, self.transpose2 | self.dequant_w) | is_op('nn.conv2d')(self.dequant_act, self.transpose2 | self.dequant_w)
+        self.reshape = is_op('reshape')(self.op)
+        self.add = is_op("add")(self.op | self.reshape, self.bias) | is_op("nn.bias_add")(self.op | self.reshape, self.bias) 
+        self.pattern = self.add
+
+    def callback(self, pre, post, node_map):
+        # import pdb; pdb.set_trace()
+        
+        deq_weight = node_map[self.dequant_w][0]
+        deq_act = node_map[self.dequant_act][0]
+        bias = node_map[self.bias][0]
+        op = node_map[self.op][0]
+        add = node_map[self.add][0]
+
+        scale_act = deq_act.args[1]
+        scale_weight = deq_weight.args[1]
+        zp_bias = tvm.relay.const(0)
+
+        scale_bias = scale_act * scale_weight
+        bias = tvm.relay.qnn.op.quantize(bias, scale_bias, zp_bias, axis=0, out_dtype='int32')
+        bias = tvm.relay.qnn.op.dequantize(bias, scale_bias, zp_bias, axis=0)
+
+        new_op = None
+        if op.op.name == "nn.conv2d":
+            conv_attrs = op.attrs
+            new_op = tvm.relay.op.nn.conv2d(
+                op.args[0],
+                op.args[1],
+                strides=conv_attrs.strides,
+                padding=conv_attrs.padding,
+                groups=conv_attrs.groups,
+                channels=conv_attrs.channels,
+                kernel_size=conv_attrs.kernel_size,
+            )
+        elif op.op.name == "nn.dense":
+            import pdb; pdb.set_trace()
+            new_op = tvm.relay.op.nn.dense(op.args[0], op.args[1])
+        else:
+            raise Exception("op must be nn.conv2d or nn.dense")
+
+        if self.reshape in node_map:
+            import pdb; pdb.set_trace()
+            x=2
+
+        new_add = None
+        if add.op.name == "add":
+            new_add = tvm.relay.add(new_op, bias)
+        elif add.op.name == "nn.bias_add":
+            axis = add.attrs.axis
+            new_add = tvm.relay.op.nn.bias_add(new_op, bias, axis=axis)
+        else:
+            raise Exception("op must be nn.conv2d or nn.dense")
+        
+        return new_add
+
+
 
 class RemoveQuantDequantSequence(DFPatternCallback):
     def __init__(self):
@@ -4198,6 +4268,7 @@ def run_buda_compile_passes(relay_module, params=None, inputs=None, target=None,
             ConvertGlobalAvgPool2dtoAvgPool2d(),
             ConvertUpsampleToResize2d(),
             DecomposeMultiIndexAdvIndex(),
+            # InsertQDQOnBiases(),
             #ReconstructQDQConvSequence(),
             #ReconstructQDQGemmSequence(),
             #RemoveQuantDequantSequence(),
